@@ -63,25 +63,109 @@ def calculate_friendship_score(T, e, m, d):
 # --- Data Parsing and Analysis ---
 
 def parse_chat(chat_file):
-    """Parses the uploaded WhatsApp chat file and returns a DataFrame."""
-    pattern = re.compile(r'(\d{1,2}/\d{1,2}/\d{2,4}, \d{1,2}:\d{2}\s?[apAPm\s]*) - ([^:]+): (.*)')
-    lines = chat_file.getvalue().decode('utf-8').splitlines()
-    data = []
-    for line in lines:
-        match = pattern.match(line)
-        if match:
-            date_str, user, message = match.groups()
-            user = user.strip()
-            try: timestamp = datetime.strptime(date_str, '%d/%m/%Y, %I:%M %p')
-            except ValueError:
-                try: timestamp = datetime.strptime(date_str, '%m/%d/%y, %I:%M %p')
-                except ValueError: continue
-            data.append([timestamp, user, message])
-    if not data:
-        st.error("Could not parse the chat file.")
+    """
+    Enhanced parser that handles:
+    - Empty messages
+    - Multi-line messages
+    - Special characters in usernames
+    - System messages
+    - Various date formats
+    """
+    full_text = chat_file.getvalue().decode('utf-8')
+    
+    # Enhanced regex pattern that handles special characters in usernames
+    # Matches: timestamp - username: message (including empty messages)
+    pattern = re.compile(
+        r'(\d{1,2}/\d{1,2}/\d{2,4},\s*\d{1,2}:\d{2}(?:\s*[APap][Mm])?)\s*-\s*([^:]+?):\s*(.*?)(?=\n\d{1,2}/\d{1,2}/\d{2,4},\s*\d{1,2}:\d{2}|\Z)',
+        re.DOTALL
+    )
+    
+    matches = pattern.findall(full_text)
+    
+    if not matches:
+        st.error("Could not find any valid user messages to parse. Please ensure the file is a standard WhatsApp chat export.")
         return None
+    
+    data = []
+    system_message_patterns = [
+        r'Messages and calls are end-to-end encrypted',
+        r'You deleted this message',
+        r'This message was deleted',
+        r'<Media omitted>',
+        r'image omitted',
+        r'video omitted',
+        r'audio omitted',
+        r'document omitted',
+        r'sticker omitted',
+        r'GIF omitted',
+        r'deleted this message',
+        r'changed (?:their|the|this) (?:phone number|group|security code)',
+        r'added you',
+        r'left',
+        r'joined using this group',
+        r'created group',
+        r'changed the subject',
+    ]
+    system_pattern = re.compile('|'.join(system_message_patterns), re.IGNORECASE)
+    
+    for match in matches:
+        date_str, user, message = match
+        user = user.strip()
+        message = message.strip()
+        
+        # Skip system messages
+        if system_pattern.search(message):
+            continue
+        
+        # Skip if the "user" looks like a system message indicator
+        # (e.g., messages without a proper username format)
+        if not user or len(user) > 100:  # Sanity check for username length
+            continue
+        
+        # Parse timestamp with multiple format support
+        timestamp = None
+        date_formats = [
+            '%m/%d/%y, %I:%M %p',
+            '%m/%d/%y, %I:%M%p',
+            '%m/%d/%y, %H:%M',
+            '%d/%m/%Y, %I:%M %p',
+            '%d/%m/%Y, %I:%M%p',
+            '%d/%m/%Y, %H:%M',
+            '%m/%d/%Y, %I:%M %p',
+            '%m/%d/%Y, %I:%M%p',
+            '%m/%d/%Y, %H:%M',
+        ]
+        
+        for fmt in date_formats:
+            try:
+                timestamp = datetime.strptime(date_str.strip(), fmt)
+                break
+            except ValueError:
+                continue
+        
+        if timestamp is None:
+            # Try without AM/PM for edge cases
+            try:
+                timestamp = datetime.strptime(date_str.strip(), '%m/%d/%y, %H:%M')
+            except ValueError:
+                continue  # Skip if no format matches
+        
+        # Keep empty messages (they're still valid interactions)
+        # but normalize them to a single space for consistency
+        if not message:
+            message = " "
+        
+        data.append([timestamp, user, message])
+    
+    if not data:
+        st.error("Parsing failed after cleaning. No valid messages were found.")
+        return None
+    
     df = pd.DataFrame(data, columns=['timestamp', 'user', 'message'])
-    df = df[df['message'] != '<Media omitted>']
+    
+    # Sort by timestamp to ensure chronological order
+    df = df.sort_values('timestamp').reset_index(drop=True)
+    
     return df
 
 def get_base_metrics(df, user, other_user):
