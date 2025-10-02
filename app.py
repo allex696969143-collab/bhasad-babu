@@ -70,6 +70,8 @@ def parse_chat(chat_file):
     - Special characters in usernames
     - System messages
     - Various date formats
+    - Spam/repeated messages detection
+    - Group chat filtering for 1-on-1 analysis
     """
     full_text = chat_file.getvalue().decode('utf-8')
     
@@ -105,8 +107,15 @@ def parse_chat(chat_file):
         r'joined using this group',
         r'created group',
         r'changed the subject',
+        r'added',
+        r'removed',
+        r'You\'re now an admin',
     ]
     system_pattern = re.compile('|'.join(system_message_patterns), re.IGNORECASE)
+    
+    # Track message repetition for spam detection
+    recent_messages = []
+    spam_threshold = 5  # If same message appears 5+ times in a row, consider it spam
     
     for match in matches:
         date_str, user, message = match
@@ -118,8 +127,7 @@ def parse_chat(chat_file):
             continue
         
         # Skip if the "user" looks like a system message indicator
-        # (e.g., messages without a proper username format)
-        if not user or len(user) > 100:  # Sanity check for username length
+        if not user or len(user) > 100:
             continue
         
         # Parse timestamp with multiple format support
@@ -144,16 +152,25 @@ def parse_chat(chat_file):
                 continue
         
         if timestamp is None:
-            # Try without AM/PM for edge cases
             try:
                 timestamp = datetime.strptime(date_str.strip(), '%m/%d/%y, %H:%M')
             except ValueError:
-                continue  # Skip if no format matches
+                continue
         
-        # Keep empty messages (they're still valid interactions)
-        # but normalize them to a single space for consistency
+        # Keep empty messages but normalize
         if not message:
             message = " "
+        
+        # Spam detection: Check if message is repeated excessively
+        recent_messages.append(message.lower().strip())
+        if len(recent_messages) > 10:
+            recent_messages.pop(0)
+        
+        # If the last 5 messages are identical, skip this one
+        if len(recent_messages) >= spam_threshold:
+            last_n = recent_messages[-spam_threshold:]
+            if len(set(last_n)) == 1 and last_n[0] == message.lower().strip():
+                continue  # Skip spam message
         
         data.append([timestamp, user, message])
     
@@ -227,18 +244,44 @@ def main():
         df = parse_chat(uploaded_file)
         if df is not None:
             users = df['user'].unique().tolist()
-            if len(users) != 2:
-                st.warning("This analysis works best for one-on-one chats."); return
+            
+            # Show user count and let them proceed even with group chats
+            st.info(f"📊 Detected {len(users)} unique users in this chat")
+            
+            if len(users) < 2:
+                st.error("Need at least 2 users for analysis.")
+                return
+            elif len(users) > 2:
+                st.warning(f"⚠️ This appears to be a group chat with {len(users)} participants. Select 2 users to analyze their relationship.")
+                
+                # Show all users with message counts
+                user_msg_counts = df['user'].value_counts()
+                st.write("**Participants and their message counts:**")
+                for user in user_msg_counts.index[:10]:  # Show top 10
+                    st.write(f"- {user}: {user_msg_counts[user]} messages")
+                if len(user_msg_counts) > 10:
+                    st.write(f"... and {len(user_msg_counts) - 10} more participants")
 
             st.sidebar.header("Analysis Options")
             user1 = st.sidebar.selectbox("Select User 1:", users, index=0)
-            user2 = st.sidebar.selectbox("Select User 2:", users, index=1)
+            user2 = st.sidebar.selectbox("Select User 2:", users, index=min(1, len(users)-1))
             
-            if user1 == user2: st.error("Please select two different users."); return
+            if user1 == user2: 
+                st.error("Please select two different users.")
+                return
+            
+            # Filter dataframe to only include messages from these two users
+            df_filtered = df[df['user'].isin([user1, user2])].copy()
+            
+            if len(df_filtered) < 10:
+                st.error(f"Not enough messages between {user1} and {user2} to perform analysis (found {len(df_filtered)} messages).")
+                return
+            
+            st.success(f"✅ Analyzing {len(df_filtered)} messages between **{user1}** and **{user2}**")
 
             if st.sidebar.button("💖 Analyze Chat"):
-                T1, e1, m1, d1, rt1 = get_base_metrics(df, user1, user2)
-                T2, e2, m2, d2, rt2 = get_base_metrics(df, user2, user1)
+                T1, e1, m1, d1, rt1 = get_base_metrics(df_filtered, user1, user2)
+                T2, e2, m2, d2, rt2 = get_base_metrics(df_filtered, user2, user1)
 
                 lovescore1, R1, E1, M1, C1 = calculate_lovescore(T1, e1, m1, d1)
                 lovescore2, R2, E2, M2, C2 = calculate_lovescore(T2, e2, m2, d2)
@@ -291,48 +334,124 @@ def main():
 
                 # --- Section 4: All Visualizations ---
                 st.header("📊 Dive Deeper into Your Chat History")
+                
                 with st.expander("See Conversation Starter & Activity Patterns"):
                     st.subheader("💬 Who Texts First?")
+                    st.markdown("""
+                    **What this shows:** This chart reveals who typically initiates conversations. A conversation is considered 
+                    "started" when someone sends a message after a gap of more than 6 hours. This metric is crucial because 
+                    consistent initiation shows genuine interest and investment in maintaining the connection.
+                    """)
                     starter_counts = analyze_starters(df)
-                    st.plotly_chart(px.pie(starter_counts, values=starter_counts.values, names=starter_counts.index, title="Who Initiates the Conversation?"), use_container_width=True)
+                    fig_pie = px.pie(starter_counts, values=starter_counts.values, names=starter_counts.index, 
+                                     title="Who Initiates the Conversation?")
+                    st.plotly_chart(fig_pie, use_container_width=True)
                     
                     st.subheader("⏰ When Do You Talk The Most?")
+                    st.markdown("""
+                    **What this shows:** These charts display your messaging patterns throughout the day and week. 
+                    Understanding peak activity times can reveal when both of you are most available and engaged. 
+                    Synchronized active hours often indicate stronger connection and compatibility.
+                    """)
                     df['hour'] = df['timestamp'].dt.hour
                     df['day_of_week'] = df['timestamp'].dt.day_name()
                     
                     act1, act2 = st.columns(2)
                     hourly_activity = df['hour'].value_counts().sort_index()
-                    act1.plotly_chart(px.bar(hourly_activity, title="Hourly Activity"), use_container_width=True)
-                    daily_activity = df['day_of_week'].value_counts().reindex(["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"])
-                    act2.plotly_chart(px.bar(daily_activity, title="Daily Activity"), use_container_width=True)
+                    fig_hourly = px.bar(hourly_activity, 
+                                       title="Messages by Hour of Day",
+                                       labels={'value': 'Number of Messages', 'index': 'Hour (24-hour format)'})
+                    fig_hourly.update_xaxes(title_text="Hour of Day")
+                    fig_hourly.update_yaxes(title_text="Number of Messages")
+                    act1.plotly_chart(fig_hourly, use_container_width=True)
+                    
+                    daily_activity = df['day_of_week'].value_counts().reindex(
+                        ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"])
+                    fig_daily = px.bar(daily_activity,
+                                      title="Messages by Day of Week",
+                                      labels={'value': 'Number of Messages', 'index': 'Day'})
+                    fig_daily.update_xaxes(title_text="Day of Week")
+                    fig_daily.update_yaxes(title_text="Number of Messages")
+                    act2.plotly_chart(fig_daily, use_container_width=True)
                 
                 with st.expander("See Reply Time Trends"):
-                    st.plotly_chart(px.line(y=rt1, title=f"Reply Times for {user1}"), use_container_width=True)
-                    st.plotly_chart(px.line(y=rt2, title=f"Reply Times for {user2}"), use_container_width=True)
+                    st.markdown("""
+                    **What this shows:** These graphs track how quickly each person responds to the other's messages over time. 
+                    Each point represents a reply, and the Y-axis shows the time taken in minutes. Lower values indicate faster responses. 
+                    Consistently quick replies suggest high priority and attentiveness, while sporadic patterns might indicate varying levels 
+                    of engagement or availability. Sudden spikes could represent busy periods or changing dynamics in the relationship.
+                    """)
+                    
+                    if rt1:
+                        fig_rt1 = px.line(x=list(range(len(rt1))), y=rt1, 
+                                         title=f"Reply Time Pattern for {user1}",
+                                         labels={'x': 'Reply Number (Chronological Order)', 'y': 'Reply Time (Minutes)'})
+                        fig_rt1.update_xaxes(title_text="Reply Sequence")
+                        fig_rt1.update_yaxes(title_text="Time to Reply (Minutes)")
+                        st.plotly_chart(fig_rt1, use_container_width=True)
+                    else:
+                        st.info(f"No reply data available for {user1}")
+                    
+                    if rt2:
+                        fig_rt2 = px.line(x=list(range(len(rt2))), y=rt2, 
+                                         title=f"Reply Time Pattern for {user2}",
+                                         labels={'x': 'Reply Number (Chronological Order)', 'y': 'Reply Time (Minutes)'})
+                        fig_rt2.update_xaxes(title_text="Reply Sequence")
+                        fig_rt2.update_yaxes(title_text="Time to Reply (Minutes)")
+                        st.plotly_chart(fig_rt2, use_container_width=True)
+                    else:
+                        st.info(f"No reply data available for {user2}")
                 
                 with st.expander("See Yearly Conversation Heatmap"):
+                    st.markdown("""
+                    **What this shows:** This calendar heatmap visualizes your conversation frequency throughout the year. 
+                    Each cell represents a day, with darker green shades indicating more messages exchanged. This helps identify:
+                    - **Consistent patterns:** Regular green squares show steady communication
+                    - **Intense periods:** Dark green clusters reveal particularly active phases in your relationship
+                    - **Gaps:** Light or empty squares might indicate time apart, conflicts, or busy periods
+                    - **Trends:** You can spot if communication is increasing, decreasing, or remaining stable over time
+                    """)
                     df['date'] = df['timestamp'].dt.date
                     activity = df['date'].value_counts()
                     activity.index = pd.to_datetime(activity.index)
-                    fig_cal, _ = calmap.calendarplot(activity, cmap='YlGn', fillcolor='lightgrey', fig_kws=dict(figsize=(12, 5)))
+                    fig_cal, _ = calmap.calendarplot(activity, cmap='YlGn', fillcolor='lightgrey', 
+                                                     fig_kws=dict(figsize=(12, 5)))
                     st.pyplot(fig_cal)
+                    st.caption("Darker green = More messages that day | Light gray = No messages")
                 
                 with st.expander("See Top Emojis & Word Clouds"):
+                    st.markdown("""
+                    **What this shows:** Emojis and frequently used words reveal emotional tone and common conversation topics. 
+                    - **Top Emojis:** Shows the most frequently used emojis, indicating emotional expression patterns
+                    - **Word Clouds:** Larger words appear more frequently in messages, revealing main conversation themes and interests
+                    
+                    Comparing both users' patterns can show how well your communication styles and interests align!
+                    """)
                     wc1, wc2 = st.columns(2)
                     for i, (user, user_df) in enumerate([(user1, df[df['user'] == user1]), (user2, df[df['user'] == user2])]):
                         col = wc1 if i == 0 else wc2
                         col.subheader(f"Analysis for {user}")
+                        
                         # Emojis
                         emojis_list = [c for msg in user_df['message'] for c in msg if c in emoji.EMOJI_DATA]
-                        emoji_df = pd.DataFrame(Counter(emojis_list).most_common(10), columns=['Emoji', 'Count'])
-                        col.dataframe(emoji_df)
+                        if emojis_list:
+                            emoji_df = pd.DataFrame(Counter(emojis_list).most_common(10), columns=['Emoji', 'Count'])
+                            col.dataframe(emoji_df, use_container_width=True)
+                        else:
+                            col.info("No emojis used")
+                        
                         # Word Cloud
                         text = " ".join(msg for msg in user_df['message'])
-                        if text:
-                            wordcloud = WordCloud(background_color='white').generate(text)
-                            fig_wc, ax_wc = plt.subplots()
-                            ax_wc.imshow(wordcloud, interpolation='bilinear'); ax_wc.axis('off')
+                        if text.strip():
+                            wordcloud = WordCloud(width=400, height=300, background_color='white', 
+                                                colormap='viridis').generate(text)
+                            fig_wc, ax_wc = plt.subplots(figsize=(8, 6))
+                            ax_wc.imshow(wordcloud, interpolation='bilinear')
+                            ax_wc.axis('off')
+                            ax_wc.set_title(f"Most Common Words", fontsize=12, pad=10)
                             col.pyplot(fig_wc)
+                        else:
+                            col.info("Not enough text for word cloud")
 
 if __name__ == "__main__":
     main()
