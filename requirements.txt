@@ -1,0 +1,8 @@
+streamlit 
+pandas 
+plotly 
+emoji 
+wordcloud 
+matplotlib 
+calmap
+setuptools
